@@ -29,6 +29,7 @@ build.ninja
 *.iobj
 *.ipdb
 *.idx
+x64/*
 
 # Binary outputs
 *.exe
@@ -38,3 +39,4 @@ build.ninja
 
 # compile commands
 compile_commands.json
+
