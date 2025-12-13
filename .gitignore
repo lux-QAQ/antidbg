@@ -30,6 +30,7 @@ build.ninja
 *.ipdb
 *.idx
 x64/*
+antidbg/x64/*
 
 # Binary outputs
 *.exe
