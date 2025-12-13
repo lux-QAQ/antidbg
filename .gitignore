@@ -6,3 +6,35 @@
 /.vs/antidbg/FileContentIndex
 /.vs/antidbg/v17
 /.vs
+
+
+.history/*
+build/*
+
+
+# CMake / Ninja build
+/build/
+/cmake-build-*/
+/CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+build.ninja
+.ninja_log
+.ninja_deps
+
+# MSVC
+*.pdb
+*.ilk
+*.idb
+*.iobj
+*.ipdb
+*.idx
+
+# Binary outputs
+*.exe
+*.dll
+*.lib
+*.obj
+
+# compile commands
+compile_commands.json
