@@ -1,22 +1,42 @@
 cmake_minimum_required(VERSION 3.15)
-project(antidebug LANGUAGES C)
+# 1. 启用 C, C++ 和 MASM 汇编支持
+project(antidebug LANGUAGES C CXX ASM_MASM)
 
 # Require x64
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-  message(FATAL_ERROR "This project targets x64 only. Please use a 64-bit toolchain/generator.")
+    message(FATAL_ERROR "This project targets x64 only. Please use a 64-bit toolchain/generator.")
 endif()
 
 # Options
 option(BUILD_SHARED_LIBS "Build antidebug as a shared library (DLL)" OFF)
-option(BUILD_EXAMPLE "Build a small example executable (if you add one)" OFF)
+option(BUILD_EXAMPLE "Build a small example executable" ON)
 
+set(CMAKE_CXX_STANDARD 20) # GH Injector 需要较新的 C++ 标准
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_POSITION_INDEPENDENT_CODE OFF) # Windows native code; switch on if you build PIC
+set(CMAKE_POSITION_INDEPENDENT_CODE OFF)
+
+# --- GH Injector Library Integration ---
+# 使用绝对路径，并确保路径正确
+set(GH_LIB_DIR "${CMAKE_SOURCE_DIR}/GuidedHacking-Injector/GH Injector Library")
+
+# 将 GH Injector Library 目录本身加入包含路径
+# 这样 #include "Start Routine.h" 就能工作了
+include_directories("${GH_LIB_DIR}")
+
+# 同时将 GuidedHacking-Injector 目录加入包含路径
+# 这样 #include "GH Injector Library/Start Routine.h" 也能工作
+include_directories("${CMAKE_SOURCE_DIR}/GuidedHacking-Injector")
+
+# 只包含 GH Injector Library 下的 .cpp 文件，不递归
+file(GLOB GH_LIB_SOURCES "${GH_LIB_DIR}/*.cpp")
+# ---------------------------------------
 
 # Collect sources
 file(GLOB_RECURSE ADBG_SOURCES
     "${CMAKE_SOURCE_DIR}/*.c"
+    "${CMAKE_SOURCE_DIR}/*.cpp"
+    "${CMAKE_SOURCE_DIR}/*.asm"
     "${CMAKE_SOURCE_DIR}/api/*.c"
     "${CMAKE_SOURCE_DIR}/asm/*.c"
     "${CMAKE_SOURCE_DIR}/core/*.c"
@@ -26,44 +46,60 @@ file(GLOB_RECURSE ADBG_SOURCES
     "${CMAKE_SOURCE_DIR}/object/*.c"
 )
 
-if (NOT ADBG_SOURCES)
-    message(FATAL_ERROR "No C sources found. Make sure this CMakeLists.txt is at project root.")
+# 将 GH Injector Library 的源文件添加到列表
+list(APPEND ADBG_SOURCES ${GH_LIB_SOURCES})
+
+# 排除 .history 目录
+list(FILTER ADBG_SOURCES EXCLUDE REGEX "[/\\\\]\\.history[/\\\\]")
+# 排除 example 目录下的源文件
+list(FILTER ADBG_SOURCES EXCLUDE REGEX "[/\\\\]example[/\\\\]")
+# 排除 GuidedHacking-Injector 下的 main.cpp (防止多重 main 定义)
+list(FILTER ADBG_SOURCES EXCLUDE REGEX "GuidedHacking-Injector[/\\\\]main\\.cpp")
+# 排除 GH Injector DNP 目录
+list(FILTER ADBG_SOURCES EXCLUDE REGEX "GuidedHacking-Injector[/\\\\]GH Injector DNP[/\\\\]")
+# 排除 GH Injector SM 目录
+list(FILTER ADBG_SOURCES EXCLUDE REGEX "GuidedHacking-Injector[/\\\\]GH Injector SM[/\\\\]")
+
+if(NOT ADBG_SOURCES)
+    message(FATAL_ERROR "No sources found.")
 endif()
 
 # Create library target
 add_library(antidebug ${ADBG_SOURCES})
 
-# Public include directory so your #include "adbg.h" and subfolder includes work
+# Public include directory
 target_include_directories(antidebug
     PUBLIC
-        ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}
+    "${GH_LIB_DIR}" # 确保库的使用者也能找到 GH 的头文件
 )
 
 # Compiler-specific flags
 if(MSVC)
-    # high warning level and disable 4201 (anonymous struct/union) which your code intentionally disables via pragma
     target_compile_options(antidebug PRIVATE /W4 /wd4201 /wd4996)
-    # enable multi-processor compilation if available
     target_compile_options(antidebug PRIVATE /MP)
 else()
-    # GCC / Clang flags
     target_compile_options(antidebug PRIVATE -Wall -Wextra -Wshadow -Wno-unused-parameter -Wno-missing-field-initializers)
-    # prefer narrow aliases warnings off if your code uses pointer-casts heavily
     target_compile_options(antidebug PRIVATE -fno-strict-aliasing)
+    # GH Injector 可能需要忽略一些警告
+    target_compile_options(antidebug PRIVATE -Wno-unknown-pragmas -Wno-missing-braces)
 endif()
 
-# Link typical windows libs (kernel32 is the must)
-target_link_libraries(antidebug PRIVATE kernel32 user32)
+target_link_libraries(antidebug PRIVATE kernel32 user32 dbghelp WinInet Urlmon WtsApi32) 
 
-# If you want a small example binary (optional)
+# Example binary
 if(BUILD_EXAMPLE)
-    # user must provide example/main.c (not included in repo by default)
-    add_executable(adbg_example examples/main.c)
+    add_executable(adbg_example example/main.cpp)
+
     target_link_libraries(adbg_example PRIVATE antidebug)
-    target_include_directories(adbg_example PRIVATE ${CMAKE_SOURCE_DIR})
+
+    target_include_directories(adbg_example PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/antidebug
+    )
 endif()
 
-# Install rules (optional)
+# Install rules
 install(TARGETS antidebug
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
@@ -74,13 +110,11 @@ install(DIRECTORY ${CMAKE_SOURCE_DIR}/
     FILES_MATCHING PATTERN "*.h"
 )
 
-# Determine readable lib type string for summary
 if(BUILD_SHARED_LIBS)
     set(LIB_TYPE "shared")
 else()
     set(LIB_TYPE "static")
 endif()
 
-# Helpful summary
 message(STATUS "antidebug: building ${LIB_TYPE} library for x64")
 message(STATUS "Sources: ${ADBG_SOURCES}")
