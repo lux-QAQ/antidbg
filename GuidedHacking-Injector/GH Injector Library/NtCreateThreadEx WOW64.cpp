@@ -1,6 +1,7 @@
 /*
  * Author:       Broihon
  * Copyright:    Guided Hacking™ © 2012-2023 Guided Hacking LLC
+ * Copyright:    luxqaqq © 2023-2024 luxqaqq
  */
 
 #include "pch.h"
@@ -9,10 +10,36 @@
 
 #include "Start Routine.h"
 
+// =============================================================
+// Antidbg Direct Syscall Declarations
+// 手动声明，避免包含 syscall.h 导致的类型冲突
+// =============================================================
+extern "C" {
+    NTSTATUS DbgNtAllocateVirtualMemory(HANDLE ProcessHandle, PVOID* BaseAddress, ULONG_PTR ZeroBits, PSIZE_T RegionSize, ULONG AllocationType, ULONG Protect);
+    NTSTATUS DbgNtFreeVirtualMemory(HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T RegionSize, ULONG FreeType);
+    NTSTATUS DbgNtWriteVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer, SIZE_T NumberOfBytesToWrite, PSIZE_T NumberOfBytesWritten);
+    NTSTATUS DbgNtReadVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer, SIZE_T NumberOfBytesToRead, PSIZE_T NumberOfBytesRead);
+    NTSTATUS DbgNtProtectVirtualMemory(HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T RegionSize, ULONG NewProtect, PULONG OldProtect);
+    NTSTATUS DbgNtCreateThreadEx(PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess, PVOID ObjectAttributes, HANDLE ProcessHandle, PVOID StartRoutine, PVOID Argument, ULONG CreateFlags, ULONG_PTR ZeroBits, SIZE_T StackSize, SIZE_T MaximumStackSize, PVOID AttributeList);
+    NTSTATUS DbgNtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount);
+    NTSTATUS DbgNtTerminateThread(HANDLE ThreadHandle, NTSTATUS ExitStatus);
+    NTSTATUS DbgNtClose(HANDLE Handle);
+    NTSTATUS DbgNtWaitForMultipleObjects(ULONG Count, PHANDLE Handles, ULONG WaitType, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
+    NTSTATUS DbgNtQueryInformationThread(HANDLE ThreadHandle, THREADINFOCLASS ThreadInformationClass, PVOID ThreadInformation, ULONG ThreadInformationLength, PULONG ReturnLength);
+    NTSTATUS DbgNtSetInformationThread(HANDLE ThreadHandle, THREADINFOCLASS ThreadInformationClass, PVOID ThreadInformation, ULONG ThreadInformationLength);
+    NTSTATUS DbgNtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER DelayInterval);
+}
+
+// 定义 ThreadWow64Context，避免依赖 nttypes.h
+#define ThreadWow64Context ((THREADINFOCLASS)29)
+
+// 辅助宏
+#define NT_STATUS_FROM_WIN32(x) ((NTSTATUS)(x) <= 0 ? ((NTSTATUS)(x)) : ((NTSTATUS) (((x) & 0x0000FFFF) | (FACILITY_NTWIN32 << 16) | ERROR_SEVERITY_ERROR)))
+
 DWORD SR_NtCreateThreadEx_WOW64(HANDLE hTargetProc, f_Routine_WOW64 pRoutine,
                                 DWORD pArg, DWORD Flags, DWORD &Out,
                                 DWORD Timeout, ERROR_DATA &error_data) {
-  LOG(2, "Begin SR_NtCreateThreadEx_WOW64\n");
+  LOG(2, "Begin SR_NtCreateThreadEx_WOW64 (Direct Syscall Version)\n");
 
   ProcessInfo pi;
   void *pEntrypoint = nullptr;
@@ -64,19 +91,28 @@ DWORD SR_NtCreateThreadEx_WOW64(HANDLE hTargetProc, f_Routine_WOW64 pRoutine,
   DWORD DataSize = sizeof(SR_REMOTE_DATA_WOW64);
   DWORD CodeSize = 0x200 - DataSize; // 保持总大小 0x200
 
-  void *pDataMem = VirtualAllocEx(hTargetProc, nullptr, DataSize,
-                                  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-  void *pCodeMem = VirtualAllocEx(hTargetProc, nullptr, CodeSize,
-                                  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  // 1. 分配数据内存 (RW) -> DbgNtAllocateVirtualMemory
+  PVOID pDataMem = nullptr;
+  SIZE_T RegionSize = DataSize;
+  NTSTATUS status = DbgNtAllocateVirtualMemory(hTargetProc, &pDataMem, 0, &RegionSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-  if (!pDataMem || !pCodeMem) {
-    if (pDataMem)
-      VirtualFreeEx(hTargetProc, pDataMem, 0, MEM_RELEASE);
-    if (pCodeMem)
-      VirtualFreeEx(hTargetProc, pCodeMem, 0, MEM_RELEASE);
+  if (NT_FAIL(status)) {
+      INIT_ERROR_DATA(error_data, (DWORD)status);
+      LOG(2, "DbgNtAllocateVirtualMemory (Data) failed: %08X\n", status);
+      return SR_NTCTE_ERR_CANT_ALLOC_MEM;
+  }
 
-    INIT_ERROR_DATA(error_data, GetLastError());
-    LOG(2, "VirtualAllocEx failed: %08X\n", error_data.AdvErrorCode);
+  // 2. 分配代码内存 (RW) -> DbgNtAllocateVirtualMemory
+  PVOID pCodeMem = nullptr;
+  RegionSize = CodeSize;
+  status = DbgNtAllocateVirtualMemory(hTargetProc, &pCodeMem, 0, &RegionSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+  if (NT_FAIL(status)) {
+    INIT_ERROR_DATA(error_data, (DWORD)status);
+    LOG(2, "DbgNtAllocateVirtualMemory (Code) failed: %08X\n", status);
+    
+    RegionSize = 0;
+    DbgNtFreeVirtualMemory(hTargetProc, &pDataMem, &RegionSize, MEM_RELEASE);
     return SR_NTCTE_ERR_CANT_ALLOC_MEM;
   }
 
@@ -187,45 +223,48 @@ DWORD SR_NtCreateThreadEx_WOW64(HANDLE hTargetProc, f_Routine_WOW64 pRoutine,
 
   LOG(2, "Data allocated at %p, Code allocated at %p\n", pDataMem, pCodeMem);
 
-  // 写入数据
-  if (!WriteProcessMemory(hTargetProc, pDataMem, Shellcode, DataSize,
-                          nullptr)) {
-    INIT_ERROR_DATA(error_data, GetLastError());
-    LOG(2, "WriteProcessMemory failed: %08X\n", error_data.AdvErrorCode);
-    VirtualFreeEx(hTargetProc, pDataMem, 0, MEM_RELEASE);
-    VirtualFreeEx(hTargetProc, pCodeMem, 0, MEM_RELEASE);
-    return SR_NTCTE_ERR_WPM_FAIL;
+  // 3. 写入数据 -> DbgNtWriteVirtualMemory
+  SIZE_T bytesWritten = 0;
+  status = DbgNtWriteVirtualMemory(hTargetProc, pDataMem, Shellcode, DataSize, &bytesWritten);
+  if (NT_FAIL(status)) {
+    INIT_ERROR_DATA(error_data, (DWORD)status);
+    LOG(2, "DbgNtWriteVirtualMemory (Data) failed: %08X\n", status);
+    goto CLEANUP_MEM;
   }
 
-  // 写入代码
-  if (!WriteProcessMemory(hTargetProc, pCodeMem, Shellcode + DataSize, CodeSize,
-                          nullptr)) {
-    INIT_ERROR_DATA(error_data, GetLastError());
-    LOG(2, "WriteProcessMemory failed: %08X\n", error_data.AdvErrorCode);
-    VirtualFreeEx(hTargetProc, pDataMem, 0, MEM_RELEASE);
-    VirtualFreeEx(hTargetProc, pCodeMem, 0, MEM_RELEASE);
-    return SR_NTCTE_ERR_WPM_FAIL;
+  // 4. 写入代码 -> DbgNtWriteVirtualMemory
+  status = DbgNtWriteVirtualMemory(hTargetProc, pCodeMem, Shellcode + DataSize, CodeSize, &bytesWritten);
+  if (NT_FAIL(status)) {
+    INIT_ERROR_DATA(error_data, (DWORD)status);
+    LOG(2, "DbgNtWriteVirtualMemory (Code) failed: %08X\n", status);
+    goto CLEANUP_MEM;
   }
 
-  // 修改代码权限为 RX
-  DWORD oldProtect = 0;
-  VirtualProtectEx(hTargetProc, pCodeMem, CodeSize, PAGE_EXECUTE_READ,
-                   &oldProtect);
+  // 5. 修改代码内存为 RX -> DbgNtProtectVirtualMemory
+  {
+      ULONG oldProtect = 0;
+      PVOID base = pCodeMem;
+      RegionSize = CodeSize;
+      status = DbgNtProtectVirtualMemory(hTargetProc, &base, &RegionSize, PAGE_EXECUTE_READ, &oldProtect);
+      if (NT_FAIL(status)) {
+          LOG(2, "DbgNtProtectVirtualMemory failed: %08X\n", status);
+      }
+  }
 
   LOG(2, "Creating thread with:\n");
   LOG(3, "pRoutine = %08X\n", MDWD(pCodeMem));
   LOG(3, "pArg     = %08X\n", MDWD(pDataMem));
 
-  NTSTATUS ntRet = NATIVE::NtCreateThreadEx(
+  // 6. 创建线程 -> DbgNtCreateThreadEx
+  status = DbgNtCreateThreadEx(
       &hThread, THREAD_ALL_ACCESS, nullptr, hTargetProc,
       FakeStartAddress ? pEntrypoint : pCodeMem, pDataMem, ntFlags, 0, 0, 0,
       nullptr);
-  if (NT_FAIL(ntRet) || !hThread) {
-    INIT_ERROR_DATA(error_data, (DWORD)ntRet);
-    LOG(2, "NtCreateThreadEx failed: %08X\n", (DWORD)ntRet);
-    VirtualFreeEx(hTargetProc, pDataMem, 0, MEM_RELEASE);
-    VirtualFreeEx(hTargetProc, pCodeMem, 0, MEM_RELEASE);
-    return SR_NTCTE_ERR_NTCTE_FAIL;
+
+  if (NT_FAIL(status) || !hThread) {
+    INIT_ERROR_DATA(error_data, (DWORD)status);
+    LOG(2, "DbgNtCreateThreadEx failed: %08X\n", status);
+    goto CLEANUP_MEM;
   }
 
   auto TID = GetThreadId(hThread);
@@ -236,40 +275,38 @@ DWORD SR_NtCreateThreadEx_WOW64(HANDLE hTargetProc, f_Routine_WOW64 pRoutine,
     WOW64_CONTEXT ctx{0};
     ctx.ContextFlags = WOW64_CONTEXT_ALL;
 
-    if (!Wow64GetThreadContext(hThread, &ctx)) {
-      INIT_ERROR_DATA(error_data, GetLastError());
-      LOG(2, "Wow64GetThreadContext failed: %08X\n", error_data.AdvErrorCode);
-      TerminateThread(hThread, 0);
-      CloseHandle(hThread);
-      VirtualFreeEx(hTargetProc, pDataMem, 0, MEM_RELEASE);
-      VirtualFreeEx(hTargetProc, pCodeMem, 0, MEM_RELEASE);
-      return SR_NTCTE_ERR_GET_CONTEXT_FAIL;
+    // 7. 获取上下文 -> DbgNtQueryInformationThread (ThreadWow64Context)
+    // 使用未文档化的 ThreadWow64Context (29) 来获取 WOW64 上下文
+    status = DbgNtQueryInformationThread(hThread, ThreadWow64Context, &ctx, sizeof(ctx), nullptr);
+    
+    if (NT_FAIL(status)) {
+      INIT_ERROR_DATA(error_data, (DWORD)status);
+      LOG(2, "DbgNtQueryInformationThread(ThreadWow64Context) failed: %08X\n", status);
+      goto CLEANUP_THREAD;
     }
 
     LOG(2, "Loaded thread context\n");
 
     ctx.Eax = MDWD(pCodeMem); // 修改为 pCodeMem
 
-    if (!Wow64SetThreadContext(hThread, &ctx)) {
-      INIT_ERROR_DATA(error_data, GetLastError());
-      LOG(2, "Wow64SetThreadContext failed: %08X\n", error_data.AdvErrorCode);
-      TerminateThread(hThread, 0);
-      CloseHandle(hThread);
-      VirtualFreeEx(hTargetProc, pDataMem, 0, MEM_RELEASE);
-      VirtualFreeEx(hTargetProc, pCodeMem, 0, MEM_RELEASE);
-      return SR_NTCTE_ERR_SET_CONTEXT_FAIL;
+    // 8. 设置上下文 -> DbgNtSetInformationThread (ThreadWow64Context)
+    status = DbgNtSetInformationThread(hThread, ThreadWow64Context, &ctx, sizeof(ctx));
+    
+    if (NT_FAIL(status)) {
+      INIT_ERROR_DATA(error_data, (DWORD)status);
+      LOG(2, "DbgNtSetInformationThread(ThreadWow64Context) failed: %08X\n", status);
+      goto CLEANUP_THREAD;
     }
 
     LOG(2, "Thread redirected\n");
 
-    if (ResumeThread(hThread) == (DWORD)-1) {
-      INIT_ERROR_DATA(error_data, GetLastError());
-      LOG(2, "ResumeThread failed: %08X\n", error_data.AdvErrorCode);
-      TerminateThread(hThread, 0);
-      CloseHandle(hThread);
-      VirtualFreeEx(hTargetProc, pDataMem, 0, MEM_RELEASE);
-      VirtualFreeEx(hTargetProc, pCodeMem, 0, MEM_RELEASE);
-      return SR_NTCTE_ERR_RESUME_FAIL;
+    // 9. 恢复线程 -> DbgNtResumeThread
+    ULONG prevSuspend = 0;
+    status = DbgNtResumeThread(hThread, &prevSuspend);
+    if (NT_FAIL(status)) {
+      INIT_ERROR_DATA(error_data, (DWORD)status);
+      LOG(2, "DbgNtResumeThread failed: %08X\n", status);
+      goto CLEANUP_THREAD;
     }
 
     LOG(2, "Thread resumed\n");
@@ -278,13 +315,18 @@ DWORD SR_NtCreateThreadEx_WOW64(HANDLE hTargetProc, f_Routine_WOW64 pRoutine,
   // Run and Forget
   if (Flags & INJ_CTF_RUN_AND_FORGET) {
     LOG(2, "Run and Forget flag set. Skipping wait and cleanup.\n");
-    CloseHandle(hThread);
+    DbgNtClose(hThread);
     return SR_ERR_SUCCESS;
   }
 
   LOG(2, "Entering wait state\n");
 
-  Sleep(SR_REMOTE_DELAY);
+  // 13. 延时 -> DbgNtDelayExecution
+  {
+      LARGE_INTEGER interval;
+      interval.QuadPart = -1 * SR_REMOTE_DELAY * 10000;
+      DbgNtDelayExecution(FALSE, &interval);
+  }
 
   DWORD dwExitCode = 0;
 
@@ -295,54 +337,40 @@ DWORD SR_NtCreateThreadEx_WOW64(HANDLE hTargetProc, f_Routine_WOW64 pRoutine,
 
   HANDLE handles[] = {hThread, g_hInterruptedEvent};
 
-  DWORD dwWaitRet = WaitForMultipleObjects(2, handles, FALSE, Timeout);
-  if (dwWaitRet != WAIT_OBJECT_0) {
-    if (dwWaitRet == (WAIT_OBJECT_0 + 1)) {
-      INIT_ERROR_DATA(error_data, dwWaitRet);
-      LOG(2, "Interrupt!\n");
-    } else {
-      if (dwWaitRet == WAIT_FAILED) {
-        INIT_ERROR_DATA(error_data, GetLastError());
-        LOG(2, "WaitForMultipleObjects failed: %08X\n",
-            error_data.AdvErrorCode);
+  // 14. 等待 -> DbgNtWaitForMultipleObjects
+  LARGE_INTEGER timeoutLI;
+  timeoutLI.QuadPart = -((LONGLONG)Timeout * 10000);
+  
+  status = DbgNtWaitForMultipleObjects(2, handles, 1, FALSE, &timeoutLI);
+  
+  if (status != STATUS_WAIT_0) {
+      if (status == STATUS_WAIT_0 + 1) {
+          INIT_ERROR_DATA(error_data, (DWORD)status);
+          LOG(2, "Interrupt!\n");
+      } else if (status == STATUS_TIMEOUT) {
+          INIT_ERROR_DATA(error_data, (DWORD)status);
+          LOG(2, "Timeout!\n");
       } else {
-        INIT_ERROR_DATA(error_data, dwWaitRet);
-        LOG(2, "Timeout!\n");
+          INIT_ERROR_DATA(error_data, (DWORD)status);
+          LOG(2, "DbgNtWaitForMultipleObjects failed: %08X\n", status);
       }
-    }
-
-    TerminateThread(hThread, 0);
-    CloseHandle(hThread);
-
-    VirtualFreeEx(hTargetProc, pDataMem, 0, MEM_RELEASE);
-    VirtualFreeEx(hTargetProc, pCodeMem, 0, MEM_RELEASE);
-
-    if (dwWaitRet == (WAIT_OBJECT_0 + 1)) {
-      return SR_ERR_INTERRUPT;
-    }
-
-    return SR_NTCTE_ERR_REMOTE_TIMEOUT;
+      
+      goto CLEANUP_THREAD;
   }
 
   LOG(2, "Thread finished execution\n");
 
-  if (!GetExitCodeThread(hThread, &dwExitCode)) {
-    INIT_ERROR_DATA(error_data, GetLastError());
-    LOG(2, "GetExitCodeThread failed: %08X\n", error_data.AdvErrorCode);
-  }
+  // 15. 读取结果 -> DbgNtReadVirtualMemory
+  status = DbgNtReadVirtualMemory(hTargetProc, pDataMem, &data, sizeof(data), nullptr);
 
-  // [修改] 从 pDataMem 读取数据
-  BOOL bRet = ReadProcessMemory(hTargetProc, pDataMem, &data, sizeof(data), nullptr);
+  DbgNtClose(hThread);
 
-  DWORD dwErr = GetLastError();
+  RegionSize = 0;
+  DbgNtFreeVirtualMemory(hTargetProc, &pDataMem, &RegionSize, MEM_RELEASE);
+  RegionSize = 0;
+  DbgNtFreeVirtualMemory(hTargetProc, &pCodeMem, &RegionSize, MEM_RELEASE);
 
-  CloseHandle(hThread);
-
-  // [修改] 释放两块内存
-  VirtualFreeEx(hTargetProc, pDataMem, 0, MEM_RELEASE);
-  VirtualFreeEx(hTargetProc, pCodeMem, 0, MEM_RELEASE);
-
-  if (bRet) {
+  if (NT_SUCCESS(status)) {
     LOG(2, "Remote data:\n");
     LOG(3, "State = %d\n", data.State);
     LOG(3, "Ret   = %08X\n", data.Ret);
@@ -350,19 +378,12 @@ DWORD SR_NtCreateThreadEx_WOW64(HANDLE hTargetProc, f_Routine_WOW64 pRoutine,
 
     if (data.State != (DWORD)SR_REMOTE_STATE::SR_RS_ExecutionFinished) {
       INIT_ERROR_DATA(error_data, data.LastWin32Error);
-      return SR_NTCTE_ERR_REMOTE_TIMEOUT; // 使用现有的超时错误码
+      return SR_NTCTE_ERR_REMOTE_TIMEOUT;
     }
-  }
-
-  // 恢复原始的错误处理逻辑
-  if (dwExitCode == 0xFFFFFFFF) {
-    INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
-    LOG(2, "Shellcode creation failed\n");
-    return SR_NTCTE_ERR_SHELLCODE_SETUP_FAIL;
-  } else if (!bRet) {
-    INIT_ERROR_DATA(error_data, dwErr);
-    LOG(2, "ReadProcessMemory failed: %08X\n", error_data.AdvErrorCode);
-    return SR_NTCTE_ERR_RPM_FAIL;
+  } else {
+      INIT_ERROR_DATA(error_data, (DWORD)status);
+      LOG(2, "DbgNtReadVirtualMemory failed: %08X\n", status);
+      return SR_NTCTE_ERR_RPM_FAIL;
   }
 
   LOG(2, "pRoutine returned: %08X\n", data.Ret);
@@ -370,6 +391,24 @@ DWORD SR_NtCreateThreadEx_WOW64(HANDLE hTargetProc, f_Routine_WOW64 pRoutine,
   Out = data.Ret;
 
   return SR_ERR_SUCCESS;
+
+CLEANUP_THREAD:
+    DbgNtTerminateThread(hThread, 0);
+    DbgNtClose(hThread);
+
+CLEANUP_MEM:
+    if (pDataMem) {
+        RegionSize = 0;
+        DbgNtFreeVirtualMemory(hTargetProc, &pDataMem, &RegionSize, MEM_RELEASE);
+    }
+    if (pCodeMem) {
+        RegionSize = 0;
+        DbgNtFreeVirtualMemory(hTargetProc, &pCodeMem, &RegionSize, MEM_RELEASE);
+    }
+    
+    if (status == STATUS_WAIT_0 + 1) return SR_ERR_INTERRUPT;
+    
+    return SR_NTCTE_ERR_REMOTE_TIMEOUT;
 }
 
 #endif

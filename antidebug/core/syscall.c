@@ -13,6 +13,53 @@ DWORD Dbg_HashSyscall(PCSTR FunctionName)
     }
     return Hash;
 }
+//通过哈希获取 ntdll 导出函数地址
+EXTERN_C PVOID DbgGetNtdllExport(DWORD FunctionHash)
+{
+    PDbg_PEB Peb = ReadPEB();
+    PDbg_PEB_LDR_DATA Ldr = Peb->Ldr;
+    PIMAGE_EXPORT_DIRECTORY ExportDirectory = NULL;
+    PVOID DllBase = NULL;
+
+    // 1. 查找 ntdll.dll 基址 (复用 MSVC 版本的遍历逻辑)
+    PDbg_LDR_DATA_TABLE_ENTRY LdrEntry;
+    // 注意：这里使用 InLoadOrderModuleList (Reserved2[1])
+    for (LdrEntry = (PDbg_LDR_DATA_TABLE_ENTRY)Ldr->Reserved2[1]; LdrEntry->DllBase != NULL; LdrEntry = (PDbg_LDR_DATA_TABLE_ENTRY)LdrEntry->Reserved1[0])
+    {
+        DllBase = LdrEntry->DllBase;
+        PIMAGE_DOS_HEADER DosHeader = (PIMAGE_DOS_HEADER)DllBase;
+        PIMAGE_NT_HEADERS NtHeaders = Dbg_RVA2VA(PIMAGE_NT_HEADERS, DllBase, DosHeader->e_lfanew);
+        PIMAGE_DATA_DIRECTORY DataDirectory = (PIMAGE_DATA_DIRECTORY)NtHeaders->OptionalHeader.DataDirectory;
+        DWORD VirtualAddress = DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        if (VirtualAddress == 0) continue;
+
+        ExportDirectory = (PIMAGE_EXPORT_DIRECTORY)Dbg_RVA2VA(ULONG_PTR, DllBase, VirtualAddress);
+        PCHAR DllName = Dbg_RVA2VA(PCHAR, DllBase, ExportDirectory->Name);
+
+        // 检查是否为 "ntdll.dll" (忽略大小写)
+        if ((*(ULONG*)DllName | 0x20202020) != 0x6c64746e) continue;
+        if ((*(ULONG*)(DllName + 4) | 0x20202020) == 0x6c642e6c) break;
+    }
+
+    if (!ExportDirectory) return NULL;
+
+    // 2. 遍历导出表查找目标函数
+    DWORD NumberOfNames = ExportDirectory->NumberOfNames;
+    PDWORD Functions = Dbg_RVA2VA(PDWORD, DllBase, ExportDirectory->AddressOfFunctions);
+    PDWORD Names = Dbg_RVA2VA(PDWORD, DllBase, ExportDirectory->AddressOfNames);
+    PWORD Ordinals = Dbg_RVA2VA(PWORD, DllBase, ExportDirectory->AddressOfNameOrdinals);
+
+    do
+    {
+        PCHAR FunctionName = Dbg_RVA2VA(PCHAR, DllBase, Names[NumberOfNames - 1]);
+        if (Dbg_HashSyscall(FunctionName) == FunctionHash)
+        {
+            return Dbg_RVA2VA(PVOID, DllBase, Functions[Ordinals[NumberOfNames - 1]]);
+        }
+    } while (--NumberOfNames);
+
+    return NULL;
+}
 
 #ifdef _MSC_VER
 static PVOID SC_Address(PVOID NtApiAddress)

@@ -476,7 +476,7 @@ std::wstring LaunchMethodToString(LAUNCH_METHOD method)
 	switch (method)
 	{
 		case LAUNCH_METHOD::LM_NtCreateThreadEx:
-			return std::wstring(L"NtCreateThreadEx");
+			return std::wstring(L"Direct_syscall_NtCreateThreadEx");
 
 		case LAUNCH_METHOD::LM_HijackThread:
 			return std::wstring(L"HijackThread");

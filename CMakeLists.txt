@@ -16,7 +16,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE OFF)
 
-# --- GH Injector Library Integration ---
+# GH Injector Library Integration 
 # 使用绝对路径，并确保路径正确
 set(GH_LIB_DIR "${CMAKE_SOURCE_DIR}/GuidedHacking-Injector/GH Injector Library")
 
@@ -25,7 +25,6 @@ set(GH_LIB_DIR "${CMAKE_SOURCE_DIR}/GuidedHacking-Injector/GH Injector Library")
 include_directories("${GH_LIB_DIR}")
 
 # 同时将 GuidedHacking-Injector 目录加入包含路径
-# 这样 #include "GH Injector Library/Start Routine.h" 也能工作
 include_directories("${CMAKE_SOURCE_DIR}/GuidedHacking-Injector")
 
 # 只包含 GH Injector Library 下的 .cpp 文件，不递归
