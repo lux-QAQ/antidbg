@@ -1,297 +1,255 @@
 /**
  * @file vch_integrity.c
- * @brief 
- * @author Lux-QAQ
- * @version 1.0.1
- * @date 2025-12-16
- * @warning 效果不好，容易误报特别是在VBA环境下，不使用
- * @copyright Copyright (c) 2025  Lux-QAQ
- * 
-*/
+ * @brief Advanced VCH Integrity Check (LBR + Timing + Dr7 Validation)
+ */
 #include "vch_integrity.h"
-#include "../core/atcptr.h"
+#include "../core/nt_helpers.h"
 #include "../core/syscall.h"
 #include <intrin.h>
 #include <stdio.h>
 
-#ifdef _DEBUG
-#define DBG_PRINT(...)                                                         \
-  do {                                                                         \
-    printf("[VCH] " __VA_ARGS__);                                              \
-    fflush(stdout);                                                            \
-  } while (0)
+// 标志位
+static volatile bool g_bDetected = false;   // 是否发现调试器痕迹
+static volatile bool g_bLbrChecked = false; // 是否成功执行了 LBR 检查逻辑
+static volatile bool g_bVchCalled = false;  // VCH 是否被调用
+static volatile unsigned __int64 g_u64StartTSC = 0; // 起始时间戳
+
+// 时间阈值：正常异常分发通常在 10k-100k 周期内
+// 调试器介入通常会导致 > 1M 周期。这里设置 0x500000 (约500万周期) 作为保守阈值
+#define RDTSC_THRESHOLD 0x500000
+
+
+
+
+#ifdef VCH_DEBUG
+#define VCH_DEBUG_PRINT(msg, ...) \
+  printf("[VCH_DEBUG] " msg "\n", __VA_ARGS__)
 #else
-#define DBG_PRINT(...)
+#define VCH_DEBUG_PRINT(msg, ...)
 #endif
-
-typedef PVOID(WINAPI *PAddVectoredContinueHandler)(ULONG,
-                                                   PVECTORED_EXCEPTION_HANDLER);
-
-// 使用静态变量传递数据，避免依赖易被 OS/Hypervisor 清除的 DR 寄存器
-static DWORD64 g_ExpectedMagic = 0;
-static volatile bool *g_pResultPtr = NULL;
 
 // -------------------------------------------------------------------------
 // 1. VEH (Vectored Exception Handler)
 // -------------------------------------------------------------------------
 static LONG WINAPI VehHandler(PEXCEPTION_POINTERS pExceptionInfo) {
-  DWORD code = pExceptionInfo->ExceptionRecord->ExceptionCode;
+  // 立即获取结束时间
+  unsigned __int64 endTSC = __rdtsc();
 
-  if (code == EXCEPTION_SINGLE_STEP) {
-    unsigned char *pIp = (unsigned char *)pExceptionInfo->ContextRecord->Rip;
-    bool bIsIcebp = false;
-    bool bIsTrap = false;
 
-    // Check ICEBP (0xF1)
-    // Trap: RIP 指向下一条指令
-    if (pIp && *(pIp - 1) == 0xF1) {
-      bIsIcebp = true;
-      bIsTrap = true;
-    }
-    // Fault: RIP 指向当前指令 (罕见，取决于 CPU/OS 实现)
-    else if (pIp && *pIp == 0xF1) {
-      bIsIcebp = true;
-      bIsTrap = false;
-    }
+  VCH_DEBUG_PRINT("VEH called. Code: %08X at RIP: %p",
+         pExceptionInfo->ExceptionRecord->ExceptionCode,
+         (void *)pExceptionInfo->ContextRecord->Rip);
 
-    if (bIsIcebp) {
-      DBG_PRINT("VEH: ICEBP detected. Resuming.\n");
-      // 即使 Dr0 为 0，我们也必须处理异常，否则进程会崩溃
-      if (!bIsTrap) {
-        pExceptionInfo->ContextRecord->Rip++;
+
+  if (pExceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+    g_bLbrChecked = true;
+    PCONTEXT ctx = pExceptionInfo->ContextRecord;
+
+    // [增强检测 1] 时间差检测
+    if (g_u64StartTSC != 0) {
+      unsigned __int64 delta = endTSC - g_u64StartTSC;
+      if (delta > RDTSC_THRESHOLD) {
+
+        VCH_DEBUG_PRINT("Timing violation! Delta: %llu cycles. Debugger "
+               "latency detected.",
+               delta);
+
+        g_bDetected = true;
       }
-      return EXCEPTION_CONTINUE_EXECUTION; // 触发 VCH
     }
-  } else if (code == EXCEPTION_ILLEGAL_INSTRUCTION) {
-    unsigned char *pIp = (unsigned char *)pExceptionInfo->ContextRecord->Rip;
-    if (pIp && *pIp == 0xF1) {
-      DBG_PRINT("VEH: ICEBP caused #UD. Skipping.\n");
-      pExceptionInfo->ContextRecord->Rip++;
-      return EXCEPTION_CONTINUE_EXECUTION;
+
+    // [已移除] Dr6 检测 (因环境兼容性导致误报)
+
+    // [增强检测 3] Dr7 持久性检测
+    // 检查我们设置的 LBR(bit 8) 和 BTF(bit 9) 是否被调试器清除
+    bool bLbrEnabled = (ctx->Dr7 & (1ULL << 8)) != 0;
+    bool bBtfEnabled = (ctx->Dr7 & (1ULL << 9)) != 0;
+    if (!bLbrEnabled || !bBtfEnabled) {
+
+      VCH_DEBUG_PRINT(
+          "[VCH_DEBUG] Dr7 violation! Bits cleared by debugger. Dr7: %016llX\n",
+          ctx->Dr7);
+
+      g_bDetected = true;
     }
+
+    // [原有检测] LBR 记录是否存在
+    if (pExceptionInfo->ExceptionRecord->NumberParameters == 0) {
+
+      VCH_DEBUG_PRINT("[VCH_DEBUG] VEH: LBR missing. Detected!\n");
+
+      g_bDetected = true;
+    } else {
+      // [原有检测] LBR 记录是否被内核地址污染
+      ULONG_PTR lbrFrom =
+          pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
+      if (lbrFrom > 0x7FFFFFFFFFFFFFFFULL) {
+
+        VCH_DEBUG_PRINT("[VCH_DEBUG] VEH: LBR polluted. Detected!\n");
+
+        g_bDetected = true;
+      }
+    }
+
+    // 清除 EFLAGS 中的 TF (Trap Flag, bit 8)
+    // 必须清除，否则 icebp 处理完后，CPU 会因为 TF 再次触发单步异常
+    ctx->EFlags &= ~0x100;
+
+    // [修正] icebp (0xF1) 触发异常时，RIP 已经指向下一条指令
+    // 因此不需要 ctx->Rip++，否则会跳过 ret 指令导致崩溃
+    // ctx->Rip++;
+
+    // 返回 Continue Execution 会触发 VCH 的调用
+    return EXCEPTION_CONTINUE_EXECUTION;
   }
 
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
 // -------------------------------------------------------------------------
-// 2. VCH (Vectored Continue Handler) - 核心校验逻辑
+// 2. VCH (Vectored Continue Handler)
 // -------------------------------------------------------------------------
 static LONG WINAPI VchHandler(PEXCEPTION_POINTERS pExceptionInfo) {
   if (pExceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
-
-    DWORD64 magic = g_ExpectedMagic;
-    volatile bool *pVerified = g_pResultPtr;
-
-    if (pVerified) {
-      bool bPassed = true;
-
-      DWORD64 currentRcx = pExceptionInfo->ContextRecord->Rcx;
-      DWORD64 currentRdx = pExceptionInfo->ContextRecord->Rdx;
-      DWORD64 currentDr6 = pExceptionInfo->ContextRecord->Dr6;
-      DWORD64 currentDr0 = pExceptionInfo->ContextRecord->Dr0;
-      DWORD64 currentDr1 = pExceptionInfo->ContextRecord->Dr1;
-      DWORD64 currentDr7 = pExceptionInfo->ContextRecord->Dr7;
-
-      DBG_PRINT("VCH Check: Magic=%llX, RCX=%llX, RDX=%llX, Dr7=%llX\n", magic,
-                currentRcx, currentRdx, currentDr7);
-
-      // [校验 A] 上下文一致性：RCX 必须等于 Magic
-      if (currentRcx != magic) {
-        DBG_PRINT("VCH: DETECTED! RCX mismatch (Got %llX, Exp %llX).\n",
-                  currentRcx, magic);
-        bPassed = false;
-      }
-
-      // [校验 B] 上下文一致性：RDX 必须等于 Magic
-      if (currentRdx != magic) {
-        DBG_PRINT("VCH: DETECTED! RDX mismatch.\n");
-        bPassed = false;
-      }
-
-      // [校验 C] Dr6 状态检查
-      // ICEBP 触发单步异常时，硬件通常置位 DR6.BS (Bit 14)
-      // 在 VBS/Hyper-V 环境下，Dr6 可能不准确 (BS 位丢失)
-      if ((currentDr6 & 0x4000) == 0) {
-        DBG_PRINT("VCH: WARNING! Dr6 BS flag missing (Dr6=%llX) - Likely VBS/Hyper-V.\n",
-                  currentDr6);
-        // 仅警告，不拦截
-      }
-
-      // [校验 D] LBR 记录检查 (宽松模式)
-      if (pExceptionInfo->ExceptionRecord->NumberParameters > 0) {
-        ULONG_PTR lbrFrom =
-            pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
-
-        // 检查是否包含内核地址 (调试器干扰迹象)
-        if (lbrFrom > 0x7FFFFFFFFFFFFFFFULL) {
-          DBG_PRINT("VCH: DETECTED! LBR contains kernel address (%p).\n",
-                    (void *)lbrFrom);
-          bPassed = false;
-        } else {
-          DBG_PRINT("VCH: LBR Check Passed (From: %p)\n", (void *)lbrFrom);
-        }
-      } else {
-        DBG_PRINT("VCH: WARNING! LBR enabled but no record found (VBS or Debugger).\n");
-      }
-
-      // [校验 E] Dr0/Dr1 寄存器完整性检查
-      // 我们在 SetupContext 中显式启用了 Dr0/Dr1 (在 Dr7 中置位 L0/L1)。
-      // 即使在 VBS 环境下，OS 也应该保存这些寄存器。
-      // 如果调试器介入，通常会接管 DR 寄存器导致值不匹配。
-      if (currentDr0 != magic) {
-          DBG_PRINT("VCH: DETECTED! Dr0 mismatch (Got %llX, Exp %llX).\n", currentDr0, magic);
-          bPassed = false;
-      }
-      
-      if (currentDr1 != (DWORD64)pVerified) {
-          DBG_PRINT("VCH: DETECTED! Dr1 mismatch (Got %llX, Exp %p).\n", currentDr1, pVerified);
-          bPassed = false;
-      }
-
-      __try {
-        *pVerified = bPassed;
-      } __except (EXCEPTION_EXECUTE_HANDLER) {
-        DBG_PRINT("VCH: Failed to write result to pointer.\n");
-      }
-    }
+    // 证明 VCH 被成功调用，异常分发链条完整
+    g_bVchCalled = true;
   }
   return EXCEPTION_CONTINUE_SEARCH;
-}
-
-// -------------------------------------------------------------------------
-// 辅助函数
-// -------------------------------------------------------------------------
-static bool SetupContext(HANDLE hThread, DWORD64 magic,
-                         volatile bool *pResultAddr) {
-  g_ExpectedMagic = magic;
-  g_pResultPtr = pResultAddr;
-
-  CONTEXT ctx = {0};
-  ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-
-  if (NT_SUCCESS(DbgNtGetContextThread(hThread, &ctx))) {
-    ctx.Dr0 = magic;
-    ctx.Dr1 = (DWORD64)pResultAddr;
-    // 开启 LBR(bit 8) 和 BTF(bit 9)
-    // 关键修改：同时开启 Dr0 (L0=bit0) 和 Dr1 (L1=bit2) 的局部启用位
-    // 这强制 OS/VBS 保存寄存器值，防止被优化掉。
-    ctx.Dr7 |= (1ULL << 0) | (1ULL << 2) | (1ULL << 8) | (1ULL << 9);
-    return NT_SUCCESS(DbgNtSetContextThread(hThread, &ctx));
-  }
-  return false;
-}
-
-static void ClearContext(HANDLE hThread) {
-  g_ExpectedMagic = 0;
-  g_pResultPtr = NULL;
-
-  CONTEXT ctx = {0};
-  ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-  if (NT_SUCCESS(DbgNtGetContextThread(hThread, &ctx))) {
-    ctx.Dr0 = 0;
-    ctx.Dr1 = 0;
-    ctx.Dr7 = 0;
-    DbgNtSetContextThread(hThread, &ctx);
-  }
 }
 
 // -------------------------------------------------------------------------
 // 主检测函数
 // -------------------------------------------------------------------------
-#if defined(_MSC_VER)
-__declspec(guard(nocf))
-#endif
 bool VchIntegrityCheck() {
-  DBG_PRINT("Starting VchIntegrityCheck (Volatile GPR Mode)...\n");
+  g_bDetected = false;
+  g_bLbrChecked = false;
+  g_bVchCalled = false;
+  g_u64StartTSC = 0;
+  NTSTATUS status;
 
-  volatile bool bSecurePathVerified = false;
-
-  DWORD64 magic = __rdtsc();
-  if (magic == 0)
-    magic = 0xDEADBEEFCAFEBABE;
-
-  HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-  if (!hKernel32)
-    return false;
-
-  PAddVectoredContinueHandler pAddVectoredContinueHandler =
-      (PAddVectoredContinueHandler)GetProcAddress(hKernel32,
-                                                  "AddVectoredContinueHandler");
-  if (!pAddVectoredContinueHandler)
-    return false;
-
-  PVOID hVeh = AddVectoredExceptionHandler(1, VehHandler);
-  PVOID hVch = pAddVectoredContinueHandler(1, VchHandler);
+  // 1. 注册隐蔽的 VEH 和 VCH
+  PVOID hVeh = Dbg_AddVectoredExceptionHandler(1, VehHandler);
+  PVOID hVch = Dbg_AddVectoredContinueHandler(1, VchHandler);
 
   if (!hVeh || !hVch) {
     if (hVeh)
-      RemoveVectoredExceptionHandler(hVeh);
+      Dbg_RemoveVectoredExceptionHandler(hVeh);
     if (hVch)
-      RemoveVectoredContinueHandler(hVch);
+      Dbg_RemoveVectoredContinueHandler(hVch);
     return false;
   }
 
-  // Shellcode:
-  // 1. MOV RAX, <Magic>
-  // 2. MOV RCX, RAX  (Volatile)
-  // 3. MOV RDX, RAX  (Volatile)
-  // 4. ICEBP
-  // 5. RET
+  // 2. 准备 Shellcode
   unsigned char code[] = {
-      0x48, 0xB8, 0x00, 0x00, 0x00,
-      0x00, 0x00, 0x00, 0x00, 0x00, // MOV RAX, <Magic> (offset 2)
-      0x48, 0x89, 0xC1,             // MOV RCX, RAX
-      0x48, 0x89, 0xC2,             // MOV RDX, RAX
-      0xF1,                         // ICEBP
-      0xC3                          // RET
+      0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00, // mov rax, 5
+      0x48, 0x83, 0xF8, 0x05,                   // cmp rax, 5
+      0x74, 0x03,                               // je branch_target
+      0x48, 0x31, 0xDB,                         // xor rbx, rbx
+      // branch_target:
+      0x9C, // pushfq
+      0x48, 0x81, 0x0C, 0x24, 0x00, 0x01, 0x00,
+      0x00, // or qword ptr[rsp], 0x100 (TF)
+      0x9D, // popfq
+      0xF1, // icebp
+      0xC3  // ret
   };
-
-  *(DWORD64 *)(code + 2) = magic;
 
   PVOID pExecMem = NULL;
   SIZE_T regionSize = sizeof(code);
+  HANDLE hProcess = (HANDLE)-1;
 
-  NTSTATUS status = DbgNtAllocateVirtualMemory(
-      (HANDLE)-1, &pExecMem, 0, &regionSize, MEM_COMMIT | MEM_RESERVE,
-      PAGE_EXECUTE_READWRITE);
+  // 步骤 A: 申请 READWRITE
+  status = DbgNtAllocateVirtualMemory(hProcess, &pExecMem, 0, &regionSize,
+                                      MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
   if (!NT_SUCCESS(status)) {
-    RemoveVectoredExceptionHandler(hVeh);
-    RemoveVectoredContinueHandler(hVch);
+    Dbg_RemoveVectoredExceptionHandler(hVeh);
+    Dbg_RemoveVectoredContinueHandler(hVch);
     return false;
   }
 
-  memcpy(pExecMem, code, sizeof(code));
-  FlushInstructionCache((HANDLE)-1, pExecMem, regionSize);
+  // 步骤 B: 写入 Shellcode
+  for (size_t i = 0; i < sizeof(code); i++)
+    ((unsigned char *)pExecMem)[i] = code[i];
 
-  HANDLE hThread = (HANDLE)-2;
-  if (SetupContext(hThread, magic, &bSecurePathVerified)) {
+  // 步骤 C: 修改权限为 EXECUTE_READ
+  ULONG oldProtect = 0;
+  PVOID pBase = pExecMem;
+  SIZE_T sizeToProtect = regionSize;
+  status = DbgNtProtectVirtualMemory(hProcess, &pBase, &sizeToProtect,
+                                     PAGE_EXECUTE_READ, &oldProtect);
 
-    DBG_PRINT("Executing Shellcode at %p with Magic %llX...\n", pExecMem,
-              magic);
-    _ReadWriteBarrier();
-
-    typedef void (*FUNC)(void);
-    FUNC f = (FUNC)pExecMem;
-
-    __try {
-      f();
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-      DBG_PRINT("Exception caught by SEH (VEH failed to handle it)\n");
-    }
-
-    ClearContext(hThread);
+  if (!NT_SUCCESS(status)) {
+    regionSize = 0;
+    DbgNtFreeVirtualMemory(hProcess, &pExecMem, &regionSize, MEM_RELEASE);
+    Dbg_RemoveVectoredExceptionHandler(hVeh);
+    Dbg_RemoveVectoredContinueHandler(hVch);
+    return false;
   }
 
+  DbgNtFlushInstructionCache(hProcess, pExecMem, regionSize);
+
+  // 3. 设置调试寄存器 (LBR + BTF)
+  HANDLE hThread = (HANDLE)-2;
+  CONTEXT ctx = {0};
+  ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+  if (NT_SUCCESS(DbgNtGetContextThread(hThread, &ctx))) {
+    ctx.Dr7 |= (1ULL << 8) | (1ULL << 9);
+
+    if (NT_SUCCESS(DbgNtSetContextThread(hThread, &ctx))) {
+
+      // 4. 执行 Shellcode
+      typedef void (*FUNC)(void);
+      FUNC f = (FUNC)pExecMem;
+
+      // [关键] 记录开始时间
+      g_u64StartTSC = __rdtsc();
+
+      __try {
+        f();
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+
+        VCH_DEBUG_PRINT("[VCH_DEBUG] Exception in shellcode caught (Code: %08X). "
+               "Ignoring if check passed.\n",
+               GetExceptionCode());
+      }
+
+      // 5. 清理 Dr7
+      ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+      DbgNtGetContextThread(hThread, &ctx);
+      ctx.Dr7 &= ~((1ULL << 8) | (1ULL << 9));
+      DbgNtSetContextThread(hThread, &ctx);
+    }
+  }
+
+  // 6. 清理资源
   regionSize = 0;
-  DbgNtFreeVirtualMemory((HANDLE)-1, &pExecMem, &regionSize, MEM_RELEASE);
+  DbgNtFreeVirtualMemory(hProcess, &pExecMem, &regionSize, MEM_RELEASE);
+  Dbg_RemoveVectoredExceptionHandler(hVeh);
+  Dbg_RemoveVectoredContinueHandler(hVch);
 
-  RemoveVectoredExceptionHandler(hVeh);
-  RemoveVectoredContinueHandler(hVch);
+  // 7. 综合判定
+  if (g_bDetected) {
+    // ForceExit();
+    return true;
+  }
 
-  DBG_PRINT("VchIntegrityCheck Result: %s (Verified: %d)\n",
-            !bSecurePathVerified ? "DETECTED" : "SAFE", bSecurePathVerified);
+  if (!g_bLbrChecked) {
 
-  return !bSecurePathVerified;
+    VCH_DEBUG_PRINT("[VCH_DEBUG] LBR check never ran! Debugger swallowed exception?\n");
+
+    // ForceExit();
+    return true;
+  }
+
+  if (!g_bVchCalled) {
+
+    VCH_DEBUG_PRINT("[VCH_DEBUG] VCH not called! Chain broken.\n");
+
+    // ForceExit();
+    return true;
+  }
+
+  return false;
 }

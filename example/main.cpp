@@ -12,14 +12,15 @@ int main() {
 
   int input = 0;
   std::cin >> input;
-   if (isProgramBeingDebugged()) {
+  std::cout << "input: " << input << std::endl;
+  /*   if (isProgramBeingDebugged()) {
       std::cout << "Debugger detected!";
-    }
-  if (input == 123456 ) {
+    } */
+  if (input == 123456) {
 
     std::cout << "OK";
   } else {
-   
+
     std::cout << "fail";
   }
   std::cout << '\n';
