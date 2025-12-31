@@ -1,3 +1,4 @@
+#if !defined(__clang__) && !defined(__GNUC__)
 .code
 
 EXTERN Dbg_GetSyscallNumber: PROC
@@ -8679,3 +8680,7 @@ DbgNtContinueEx PROC
 DbgNtContinueEx ENDP
 
 end
+
+
+
+#endif
